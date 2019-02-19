@@ -21,3 +21,5 @@ executable hsam
                      , cli
                      , turtle
                      , cryptohash
+                     , mtl
+                     , text
