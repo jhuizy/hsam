@@ -4,12 +4,22 @@
 
 module Main where
 
+import           Control.Monad        (void, when)
+import           Crypto.Hash
+import qualified Data.ByteString.Lazy as LB
 import qualified Data.Text            as T
 import           Turtle
 import qualified Turtle
 
+import qualified Data.HashMap as HM
+
+import           Control.Lens
+import           Network.AWS
+import           Network.AWS.S3
+
 data CFConfig = CFConfig
   { cfcDeployBucket :: String
+  , cfcDeployKey    :: String
   , cfcRegion       :: String
   , cfcStackName    :: String
   , cfcParameters   :: [CFParameter]
@@ -21,12 +31,13 @@ data CFParameter = CFParameter
   } deriving (Show)
 
 mkConfig :: CFConfig
-mkConfig = CFConfig bucket region name params
+mkConfig = CFConfig bucket key region name params
   where
     bucket = "wc-dl-cloudformation-dev"
+    key = "wc-dl-sandbox-stepfn"
     region = "ap-southeast-2"
     name = "wc-dl-sandbox-stepfn-procurement-analytics"
-    params = 
+    params =
       [ CFParameter "DataLakeStackName" "wc-dl-base"
       , CFParameter "ReportName" "procurement_analytics"
       , CFParameter "Environment" "dev"
@@ -54,7 +65,7 @@ package :: CFConfig -> Turtle.FilePath -> IO Turtle.FilePath
 package cfg f = do
   cd f
   shell (T.pack $ "aws cloudformation package --template-file " <> templateFile <> " --output-template-file " <> outputTemplateFile <> " --s3-bucket " <> deployBucket) empty
-  return $ f <> decodeString "output.template.yml"
+  return $ f <> decodeString outputTemplateFile
     where
       templateFile = "stepfunction.yml"
       outputTemplateFile = "stepfunction.output.yml"
@@ -64,17 +75,42 @@ build :: Turtle.FilePath -> IO Turtle.FilePath
 build f = do
   let root = f <> decodeString "lambdas"
   cd root
+  mkdir $ f <> decodeString ".build"
   shell "npm install" empty
   shell "npm run build" empty
   rmtree $ root <> decodeString "node_modules"
   shell "npm install --prod" empty
+  cp (root <> decodeString "index.ts") (root <> decodeString ".build/index.ts")
   return $ root <> decodeString "build"
+
+shouldPackage :: CFConfig -> Turtle.FilePath -> IO Bool
+shouldPackage cfg f = do
+  newMd5 <- LB.readFile . encodeString $ f
+  env <- newEnv Discover
+  obj <- runResourceT . runAWS env . send $ getObject (BucketName bucket) (ObjectKey key)
+  let oldMd5Text = obj ^. gorsMetadata ^.at "md5"
+  let newMd5Text = Just . T.pack . show $ (hashlazy newMd5 :: Digest MD5)
+  return $ oldMd5Text /= newMd5Text
+    where
+      bucket = T.pack $ cfcDeployBucket cfg
+      key = T.pack $ cfcDeployKey cfg
+
+shouldBuild :: Turtle.FilePath -> IO Bool
+shouldBuild f = do
+  let root = f <> decodeString "lambdas"
+  cd root
+  newFileContent <- LB.readFile . encodeString $ root <> decodeString "index.ts"
+  oldFileContent <- LB.readFile . encodeString $ root <> decodeString ".build/index.ts"
+  let oldmd5 = hashlazy newFileContent :: Digest MD5
+  let newmd5 = hashlazy oldFileContent :: Digest MD5
+  return $ oldmd5 /= newmd5
 
 main :: IO ()
 main = do
   let f = decodeString "/Users/jordan/Documents/work/water/lake/landing-to-raw/sandboxes/procurement-analytics"
   let cfg = mkConfig
-  build f
+  sb <- shouldBuild f
+  when sb $ void (build f)
   tpl <- package cfg f
   deploy cfg tpl
-  
+
