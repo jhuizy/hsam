@@ -27,6 +27,6 @@ executable hsam
                      , amazonka
                      , amazonka-core
                      , amazonka-s3
-                     , unordered-containers
                      , lens
-                     , hashmap
+                     , regex-compat
+                     , zip-archive

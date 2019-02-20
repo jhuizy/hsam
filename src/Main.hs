@@ -7,15 +7,18 @@ module Main where
 import           Control.Monad        (void, when)
 import           Crypto.Hash
 import qualified Data.ByteString.Lazy as LB
+import           Data.Maybe
 import qualified Data.Text            as T
 import           Turtle
 import qualified Turtle
 
-import qualified Data.HashMap as HM
-
 import           Control.Lens
+import           Control.Monad
 import           Network.AWS
 import           Network.AWS.S3
+
+import           Codec.Archive.Zip
+import           Text.Regex
 
 data CFConfig = CFConfig
   { cfcDeployBucket :: String
@@ -64,24 +67,23 @@ deploy cfg f = do
 package :: CFConfig -> Turtle.FilePath -> IO Turtle.FilePath
 package cfg f = do
   cd f
-  shell (T.pack $ "aws cloudformation package --template-file " <> templateFile <> " --output-template-file " <> outputTemplateFile <> " --s3-bucket " <> deployBucket) empty
-  return $ f <> decodeString outputTemplateFile
+  file <- readFile templateFile
+  env <- newEnv Discover
+  let uris = (mapMaybe matcher . lines) file
+  urisToReplace <- forM uris $ \uri -> do
+    let zipDestination = encodeString f <> "output.zip"
+    addFilesToArchive [OptRecursive, OptDestination zipDestination] emptyArchive [encodeString f <> uri]
+    runResourceT . runAWS env . send $ putObject (BucketName . T.pack $ deployBucket) (ObjectKey . T.pack $ deployKey) (toBody zipDestination)
+    return (uri, "s3://" <> deployBucket <> "/" <> deployKey)
+  forM_ urisToReplace $ \(oldUri, newUri) -> writeFile outputTemplateFile (unlines . map (replacer oldUri newUri) . lines $ file)
+  return $ decodeString outputTemplateFile
     where
+      matcher s = matchRegex (mkRegex "CodeUri: (.+)") s >>= listToMaybe
+      replacer oldUri newUri s = subRegex (mkRegex "CodeUri: (.+)") s ("CodeUri: " <> newUri)
       templateFile = "stepfunction.yml"
       outputTemplateFile = "stepfunction.output.yml"
       deployBucket = cfcDeployBucket cfg
-
-build :: Turtle.FilePath -> IO Turtle.FilePath
-build f = do
-  let root = f <> decodeString "lambdas"
-  cd root
-  mkdir $ f <> decodeString ".build"
-  shell "npm install" empty
-  shell "npm run build" empty
-  rmtree $ root <> decodeString "node_modules"
-  shell "npm install --prod" empty
-  cp (root <> decodeString "index.ts") (root <> decodeString ".build/index.ts")
-  return $ root <> decodeString "build"
+      deployKey = cfcDeployKey cfg
 
 shouldPackage :: CFConfig -> Turtle.FilePath -> IO Bool
 shouldPackage cfg f = do
@@ -94,6 +96,18 @@ shouldPackage cfg f = do
     where
       bucket = T.pack $ cfcDeployBucket cfg
       key = T.pack $ cfcDeployKey cfg
+
+build :: Turtle.FilePath -> IO Turtle.FilePath
+build f = do
+  let root = f <> decodeString "lambdas"
+  cd root
+  mkdir $ f <> decodeString ".build"
+  shell "npm install" empty
+  shell "npm run build" empty
+  rmtree $ root <> decodeString "node_modules"
+  shell "npm install --prod" empty
+  cp (root <> decodeString "index.ts") (root <> decodeString ".build/index.ts")
+  return $ root <> decodeString "build"
 
 shouldBuild :: Turtle.FilePath -> IO Bool
 shouldBuild f = do
