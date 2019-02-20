@@ -9,7 +9,9 @@ import           Crypto.Hash
 import qualified Data.ByteString.Lazy as LB
 import           Data.Maybe
 import qualified Data.Text            as T
-import           Turtle
+import           System.FilePath
+import           Turtle               (cd, cp, decodeString, empty,
+                                       encodeString, mkdir, mv, rmtree, shell)
 import qualified Turtle
 
 import           Control.Lens
@@ -36,21 +38,13 @@ data CFParameter = CFParameter
 mkConfig :: CFConfig
 mkConfig = CFConfig bucket key region name params
   where
-    bucket = "wc-dl-cloudformation-dev"
-    key = "wc-dl-sandbox-stepfn"
+    bucket = "cf-templates-qgrkfiisxmqc-ap-southeast-2"
+    key = "budgeter-deployment"
     region = "ap-southeast-2"
-    name = "wc-dl-sandbox-stepfn-procurement-analytics"
+    name = "budgeter"
     params =
-      [ CFParameter "DataLakeStackName" "wc-dl-base"
-      , CFParameter "ReportName" "procurement_analytics"
-      , CFParameter "Environment" "dev"
-      , CFParameter "DatamartUsername" "admin"
-      , CFParameter "VpcId" "vpc-015d49423592b1aac"
-      , CFParameter "SecurityGroupId" "sg-0ad15ac7efec366ac"
-      , CFParameter "PrivateSubetA" "subnet-0c6a0e8d7ab858f67"
-      , CFParameter "PrivateSubetB" "subnet-0fa69ef0d3ef08fac"
-      , CFParameter "TempBucket" "wc-dl-base-temp-982209102910-ap-southeast-2"
-      , CFParameter "RedshiftConnectionName" "Redshift"
+      [ CFParameter "Username" "myusername"
+      , CFParameter "Password" "mypassword"
       ]
 
 deploy :: CFConfig -> Turtle.FilePath -> IO ()
@@ -80,8 +74,8 @@ package cfg f = do
     where
       matcher s = matchRegex (mkRegex "CodeUri: (.+)") s >>= listToMaybe
       replacer oldUri newUri s = subRegex (mkRegex "CodeUri: (.+)") s ("CodeUri: " <> newUri)
-      templateFile = "stepfunction.yml"
-      outputTemplateFile = "stepfunction.output.yml"
+      templateFile = "template.yml"
+      outputTemplateFile = "template.output.yml"
       deployBucket = cfcDeployBucket cfg
       deployKey = cfcDeployKey cfg
 
@@ -99,7 +93,7 @@ shouldPackage cfg f = do
 
 build :: Turtle.FilePath -> IO Turtle.FilePath
 build f = do
-  let root = f <> decodeString "lambdas"
+  let root = f <> decodeString "src/processor"
   cd root
   mkdir $ f <> decodeString ".build"
   shell "npm install" empty
@@ -111,7 +105,7 @@ build f = do
 
 shouldBuild :: Turtle.FilePath -> IO Bool
 shouldBuild f = do
-  let root = f <> decodeString "lambdas"
+  let root = f <> decodeString "src/processor"
   cd root
   newFileContent <- LB.readFile . encodeString $ root <> decodeString "index.ts"
   oldFileContent <- LB.readFile . encodeString $ root <> decodeString ".build/index.ts"
@@ -119,9 +113,76 @@ shouldBuild f = do
   let newmd5 = hashlazy oldFileContent :: Digest MD5
   return $ oldmd5 /= newmd5
 
+data LambdaRuntime = Node610 deriving (Show)
+
+data Lambda = Lambda
+  { lambdaPath :: Prelude.FilePath
+  , lambdaRuntime      :: LambdaRuntime
+  } deriving (Show)
+
+newtype BuiltLambda = BuiltLambda
+  { builtLambdaPath :: String
+  } deriving (Show)
+
+data PackagedLambda = PackagedLambda
+  { packagedLambdaS3Location :: String
+  , packagedLambdaCodeUri :: String
+  } deriving (Show)
+
+lambdasToBuild :: Prelude.FilePath -> IO [Lambda]
+lambdasToBuild f = do
+  file <- readFile $ f </> templateFile
+  return $ toLambda <$> (mapMaybe matcher . lines) file
+    where
+      templateFile = "template.yml"
+      matcher s = matchRegex (mkRegex "CodeUri: (.+)") s >>= listToMaybe
+      toLambda uri = Lambda (f </> uri) Node610
+
+buildLambda :: Lambda -> IO BuiltLambda
+buildLambda (Lambda path Node610) = do
+  let nodeModulesDir = path </> "node_modules"
+  cd $ decodeString path
+  shell "npm install" empty
+  shell "npm run build" empty
+  rmtree $ decodeString nodeModulesDir
+  shell "npm install --prod" empty
+  return $ BuiltLambda path
+
+packageLambda :: CFConfig -> BuiltLambda -> IO PackagedLambda
+packageLambda cfg (BuiltLambda path) = do
+  archive <- addFilesToArchive [OptRecursive] emptyArchive [path]
+  LB.writeFile zipDestination $ fromArchive archive
+  return $ PackagedLambda "s3://" path
+    where 
+      s3Destination = "s3://" <> bucket <> "/" <> key <> ""
+      zipDestination = path </> "package.zip"
+      bucket = cfcDeployBucket cfg
+      key = cfcDeployKey cfg
+
+-- package :: CFConfig -> Turtle.FilePath -> IO Turtle.FilePath
+-- package cfg f = do
+--   cd f
+--   file <- readFile templateFile
+--   env <- newEnv Discover
+--   let uris = (mapMaybe matcher . lines) file
+--   urisToReplace <- forM uris $ \uri -> do
+--     let zipDestination = encodeString f <> "output.zip"
+--     addFilesToArchive [OptRecursive, OptDestination zipDestination] emptyArchive [encodeString f <> uri]
+--     runResourceT . runAWS env . send $ putObject (BucketName . T.pack $ deployBucket) (ObjectKey . T.pack $ deployKey) (toBody zipDestination)
+--     return (uri, "s3://" <> deployBucket <> "/" <> deployKey)
+--   forM_ urisToReplace $ \(oldUri, newUri) -> writeFile outputTemplateFile (unlines . map (replacer oldUri newUri) . lines $ file)
+--   return $ decodeString outputTemplateFile
+--     where
+--       matcher s = matchRegex (mkRegex "CodeUri: (.+)") s >>= listToMaybe
+--       replacer oldUri newUri s = subRegex (mkRegex "CodeUri: (.+)") s ("CodeUri: " <> newUri)
+--       templateFile = "template.yml"
+--       outputTemplateFile = "template.output.yml"
+--       deployBucket = cfcDeployBucket cfg
+--       deployKey = cfcDeployKey cfg
+
 main :: IO ()
 main = do
-  let f = decodeString "/Users/jordan/Documents/work/water/lake/landing-to-raw/sandboxes/procurement-analytics"
+  let f = decodeString "/Users/jordan/Documents/code/budgeter"
   let cfg = mkConfig
   sb <- shouldBuild f
   when sb $ void (build f)

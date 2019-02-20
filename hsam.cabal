@@ -30,3 +30,4 @@ executable hsam
                      , lens
                      , regex-compat
                      , zip-archive
+                     , filepath
